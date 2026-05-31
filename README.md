@@ -1,38 +1,79 @@
-# Sandy Pong
+# Sandy Pong (server)
 
-Luxury multiplayer Pong with invite-only room codes. Static client lives on borkbook.com; this repo is just the realtime server.
+Multiplayer authority for the Pong game embedded at https://borkbook.com/games/sandy-pong/. This repo is the Socket.IO server only — the static client lives in [`tracer-workspace`](https://github.com/BunPrinceton/tracer-workspace) under `games/sandy-pong/index.html`.
 
-## Local dev (full stack)
+- **Live**: https://sandy-pong-server.onrender.com (Render free tier)
+- **Health**: https://sandy-pong-server.onrender.com/health → `{ok, rooms, ips}`
+- **Play**: https://borkbook.com/games/sandy-pong/
+
+## What it does
+
+- Hosts invite-only 2-player rooms keyed by 5-char codes (`[A-Z2-9]`, no confusables)
+- Authoritative physics @ 60 Hz; clients only send paddle direction (`'up' | 'down' | null`)
+- Broadcasts game state to both players over Socket.IO
+- First to 7 wins; rematch supported (host only)
+
+For solo/offline play, the **client** has a separate bot mode that runs the same physics in the browser — it does not touch this server.
+
+## Run locally
 
 ```bash
 npm install
-npm run dev
+npm run dev        # concurrently: server on :4000, Vite dev client on :5173
+# or:
+npm start          # server only, no client
 ```
 
-- Client: http://localhost:5173
-- Server: http://localhost:4000
+`client/` is a Vite + React dev sandbox for iterating on UI ideas; not used in production.
 
-## Production server only
+## Deploy
 
-Render deploys `server.js` directly. The static client (under `client/`) is for local dev — borkbook hosts its own copy at `/games/sandy-pong/`.
+Already deployed via `render.yaml` (Blueprint). To redeploy: push to `main`; Render auto-deploys on commit (`autoDeploy: true`).
 
-## Deploying the server to Render
+To reproduce from scratch on a new Render account:
+1. Fork/clone this repo to your GitHub.
+2. Render dashboard → **New +** → **Blueprint** → select the repo → **Apply**.
+3. Render reads `render.yaml`, creates the `sandy-pong-server` web service (Free plan).
+4. Note the URL; if it isn't `sandy-pong-server.onrender.com`, update `DEFAULT_WS` in the static client (`tracer-workspace/games/sandy-pong/index.html`) and push that repo too.
 
-1. Push this repo to GitHub.
-2. https://dashboard.render.com → **New +** → **Web Service** → connect the repo.
-3. Render reads `render.yaml` and picks `sandy-pong-server`. Click **Apply**.
-4. Wait ~2 min for the first build. URL will be something like `https://sandy-pong-server.onrender.com`.
-5. If your service URL differs from `sandy-pong-server.onrender.com`, edit `DEFAULT_WS` in `tracer-workspace/games/sandy-pong/index.html` to match.
-
-**Free-tier note:** the server sleeps after ~15 min of inactivity. First request after sleep takes ~30 s to wake — the game page shows a "Waking the rally" overlay during that time.
+**Free tier note**: the service sleeps after ~15 min idle. First request after sleep takes ~30 s to wake. The client shows a "Waking the rally" overlay during this window.
 
 ## Protocol
 
 Socket.IO events (client ↔ server):
-- `create` → `joined { code, side: 'left' }` + `roomState`
-- `join` (code) → `joined { code, side: 'right' }` + `roomState`, or `error_msg`
-- `start` (host only) → `roomState` with `state.running = true`
-- `input` ('up' | 'down' | null) per player
-- `state` (server broadcast @60Hz while running)
-- `rematch` (host only)
-- `opponent_left` (broadcast)
+
+| Event | Direction | Payload | Notes |
+|---|---|---|---|
+| `create` | C→S | — | Generates room code, makes caller `left` (host) |
+| `join` | C→S | `string` (code) | Joins as `right`; validates `^[A-Z0-9]{5}$` |
+| `joined` | S→C | `{code, side}` | Caller's assignment |
+| `roomState` | S→C(room) | `{code, players, state}` | Sent on join/start/disconnect |
+| `start` | C→S | — | Host only; flips `running = true` |
+| `input` | C→S | `'up' \| 'down' \| null` | Per-frame paddle direction |
+| `state` | S→C(room) | full game state | Broadcast at 60 Hz while `running` |
+| `rematch` | C→S | — | Host only; resets state |
+| `opponent_left` | S→C(room) | — | When the other player disconnects |
+| `error_msg` | S→C | `string` | Human-readable error |
+
+## Hardening
+
+- **CORS allowlist**: `borkbook.com`, `bunprinceton.github.io`, `localhost:5173/4173`
+- **Rate limits** (per-IP, sliding 60 s window): `create` ≤ 5, `join` ≤ 15
+- **Concurrent rooms cap**: 200 (rejects further `create` with "server busy")
+- **Payload cap**: 1 KB (`maxHttpBufferSize`)
+- **Input validation**: room-code regex, paddle-direction enum
+- **Host-only authorization** on `start` and `rematch`
+- **Auto-cleanup** every 30 s: empty rooms drop after 60 s grace; idle rooms (no input 15 min) close; unstarted lobbies expire at 30 min
+- **Real client IP**: `app.set('trust proxy', 1)` so the rate limiter reads `X-Forwarded-For` behind Render's LB
+- **No persistence**: rooms are in-memory only; nothing is written to disk
+
+## Stack
+
+- Node.js 20 (`engines.node >= 20`)
+- Express ^4.19
+- Socket.IO ^4.7
+- Deploy: Render (Blueprint via `render.yaml`)
+
+## Costs
+
+$0 — Render free tier (750 hr/mo runtime, 100 GB/mo egress; Pong's tiny payloads make egress a non-issue).

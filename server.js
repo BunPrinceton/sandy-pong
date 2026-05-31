@@ -3,9 +3,25 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 
 const app = express();
+app.set('trust proxy', 1); // Render sits behind a load balancer
 const httpServer = createServer(app);
+
+const ALLOWED_ORIGINS = [
+  'https://borkbook.com',
+  'https://www.borkbook.com',
+  'https://bunprinceton.github.io',
+  'http://localhost:5173',
+  'http://localhost:4173',
+];
+
 const io = new Server(httpServer, {
-  cors: { origin: '*' },
+  cors: {
+    origin: ALLOWED_ORIGINS,
+    methods: ['GET', 'POST'],
+  },
+  maxHttpBufferSize: 1024,
+  pingInterval: 25000,
+  pingTimeout: 60000,
 });
 
 const WIDTH = 800;
@@ -16,13 +32,49 @@ const BALL_R = 8;
 const PADDLE_SPEED = 7;
 const WIN_SCORE = 7;
 
+const MAX_ROOMS = 200;
+const MAX_ROOM_AGE_IDLE_MS = 15 * 60 * 1000;
+const MAX_ROOM_AGE_LOBBY_MS = 30 * 60 * 1000;
+const EMPTY_ROOM_GRACE_MS = 60 * 1000;
+
+const RATE_LIMITS = {
+  create: { max: 5, windowMs: 60_000 },
+  join: { max: 15, windowMs: 60_000 },
+};
+
 const rooms = new Map();
+const ipBuckets = new Map();
+
+function getIp(socket) {
+  const fwd = socket.handshake.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd.length) return fwd.split(',')[0].trim();
+  return socket.handshake.address || 'unknown';
+}
+
+function checkRate(ip, action) {
+  const cfg = RATE_LIMITS[action];
+  if (!cfg) return true;
+  const now = Date.now();
+  let buckets = ipBuckets.get(ip);
+  if (!buckets) { buckets = {}; ipBuckets.set(ip, buckets); }
+  const arr = (buckets[action] || []).filter((t) => now - t < cfg.windowMs);
+  if (arr.length >= cfg.max) {
+    buckets[action] = arr;
+    return false;
+  }
+  arr.push(now);
+  buckets[action] = arr;
+  return true;
+}
 
 function makeCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return rooms.has(code) ? makeCode() : code;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    let code = '';
+    for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    if (!rooms.has(code)) return code;
+  }
+  return null;
 }
 
 function newGameState() {
@@ -123,11 +175,28 @@ function publicRoom(room) {
 io.on('connection', (socket) => {
   let currentRoom = null;
   let currentSide = null;
+  const ip = getIp(socket);
 
   socket.on('create', () => {
+    if (!checkRate(ip, 'create')) {
+      socket.emit('error_msg', 'Slow down — too many rooms created');
+      return;
+    }
+    if (rooms.size >= MAX_ROOMS) {
+      socket.emit('error_msg', 'Server busy, try again in a moment');
+      return;
+    }
+    if (currentRoom) return; // already in a room
     const code = makeCode();
+    if (!code) {
+      socket.emit('error_msg', 'Could not generate a unique room code');
+      return;
+    }
+    const now = Date.now();
     const room = {
       code,
+      createdAt: now,
+      lastActivity: now,
       players: { left: socket.id, right: null },
       names: { left: 'Player 1', right: null },
       inputs: { left: null, right: null },
@@ -142,7 +211,17 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join', (rawCode) => {
-    const code = (rawCode || '').toUpperCase().trim();
+    if (!checkRate(ip, 'join')) {
+      socket.emit('error_msg', 'Slow down — too many join attempts');
+      return;
+    }
+    if (currentRoom) return;
+    if (typeof rawCode !== 'string') { socket.emit('error_msg', 'Invalid code'); return; }
+    const code = rawCode.toUpperCase().trim();
+    if (!/^[A-Z0-9]{5}$/.test(code)) {
+      socket.emit('error_msg', 'Invalid code');
+      return;
+    }
     const room = rooms.get(code);
     if (!room) {
       socket.emit('error_msg', 'Room not found');
@@ -154,6 +233,7 @@ io.on('connection', (socket) => {
     }
     room.players.right = socket.id;
     room.names.right = 'Player 2';
+    room.lastActivity = Date.now();
     socket.join(code);
     currentRoom = code;
     currentSide = 'right';
@@ -164,26 +244,30 @@ io.on('connection', (socket) => {
   socket.on('start', () => {
     const room = rooms.get(currentRoom);
     if (!room) return;
+    if (room.players.left !== socket.id) return; // only host can start
     if (!room.players.left || !room.players.right) return;
     room.state = newGameState();
     room.state.running = true;
+    room.lastActivity = Date.now();
     io.to(currentRoom).emit('roomState', publicRoom(room));
   });
 
   socket.on('input', (dir) => {
     const room = rooms.get(currentRoom);
     if (!room || !currentSide) return;
-    if (dir === 'up' || dir === 'down' || dir === null) {
-      room.inputs[currentSide] = dir;
-    }
+    if (dir !== 'up' && dir !== 'down' && dir !== null) return;
+    room.inputs[currentSide] = dir;
+    room.lastActivity = Date.now();
   });
 
   socket.on('rematch', () => {
     const room = rooms.get(currentRoom);
     if (!room) return;
+    if (room.players.left !== socket.id) return;
     if (!room.players.left || !room.players.right) return;
     room.state = newGameState();
     room.state.running = true;
+    room.lastActivity = Date.now();
     io.to(currentRoom).emit('roomState', publicRoom(room));
   });
 
@@ -199,8 +283,9 @@ io.on('connection', (socket) => {
       room.players.right = null;
       room.names.right = null;
     }
+    room.lastActivity = Date.now();
     if (!room.players.left && !room.players.right) {
-      rooms.delete(currentRoom);
+      room.emptiedAt = Date.now();
     } else {
       room.state.running = false;
       io.to(currentRoom).emit('roomState', publicRoom(room));
@@ -218,10 +303,42 @@ setInterval(() => {
   }
 }, 1000 / 60);
 
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, room] of rooms) {
+    if (room.emptiedAt && now - room.emptiedAt > EMPTY_ROOM_GRACE_MS) {
+      rooms.delete(code);
+      continue;
+    }
+    if (!room.state.running && !room.state.winner && now - room.createdAt > MAX_ROOM_AGE_LOBBY_MS) {
+      io.to(code).emit('error_msg', 'Room expired');
+      io.in(code).disconnectSockets(true);
+      rooms.delete(code);
+      continue;
+    }
+    if (now - room.lastActivity > MAX_ROOM_AGE_IDLE_MS) {
+      io.to(code).emit('error_msg', 'Room idle, closing');
+      io.in(code).disconnectSockets(true);
+      rooms.delete(code);
+    }
+  }
+  for (const [ip, buckets] of ipBuckets) {
+    let any = false;
+    for (const k of Object.keys(buckets)) {
+      if (buckets[k].some((t) => now - t < 5 * 60_000)) { any = true; break; }
+    }
+    if (!any) ipBuckets.delete(ip);
+  }
+}, 30_000);
+
 const PORT = process.env.PORT || 4000;
 
 app.get('/', (req, res) => {
   res.type('text/plain').send('Sandy Pong server is awake.');
+});
+
+app.get('/health', (req, res) => {
+  res.json({ ok: true, rooms: rooms.size, ips: ipBuckets.size });
 });
 
 httpServer.listen(PORT, () => {
